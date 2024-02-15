@@ -4,13 +4,15 @@
 
 ---
 
-Teacher model: 10 layer CNN
-Student model: 2 layer CNN
+# Parameters
 
-learning rate = 0.1
-batch size = 128
-epoch = 160
-optimizer = optim.SGD(student.parameters(), lr=0.1, momentum=0.9, nesterov=True, weight_decay=1e-4)
+- Teacher model: 10 layer CNN
+- Student model: 2 layer CNN
+
+- learning rate = 0.1
+- batch size = 128
+- epoch = 160
+- optimizer = optim.SGD(student.parameters(), lr=0.1, momentum=0.9, nesterov=True, weight_decay=1e-4)
 
 ---
 
