@@ -7,6 +7,7 @@
 # Parameters
 
 - Teacher model: 10 layer CNN
+- TA model: 4 layer CNN
 - Student model: 2 layer CNN
 
 - learning rate = 0.1
@@ -17,4 +18,5 @@
 ---
 
 ## 참고 자료
+
 http://dmqm.korea.ac.kr/uploads/seminar/Introduction%20to%20Knowledge%20Distillation_%ED%99%A9%ED%95%98%EC%9D%80.pdf
