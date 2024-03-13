@@ -6,10 +6,14 @@ import torchvision.datasets as datasets
 import torch.nn.functional as F
 from model_list import *
 from modelMaker import ConvNetMaker
+from algorithm import *
 import os
 import time
-import random
-
+import numpy as np
+from sklearn.manifold import TSNE
+import matplotlib.pyplot as plt
+import matplotlib.cm as cm
+import nni
 
 # Check if GPU is available, and if not, use the CPU
 
@@ -98,405 +102,47 @@ def test(model, test_loader, device):
     return accuracy
 
 
-def train_knowledge_distillation(
-    teacher,
-    student,
-    train_loader,
-    epochs,
-    learning_rate,
-    T,
-    soft_target_loss_weight,
-    ce_loss_weight,
-    device,
-):
-    ce_loss = nn.CrossEntropyLoss()
-    optimizer = optim.SGD(
-        student.parameters(),
-        lr=learning_rate,
-        momentum=0.9,
-        nesterov=True,
-        weight_decay=1e-4,
+def print_tSNE(model, dataloader):
+    model.eval()
+    # 최종 출력층 데이터 추출
+    final_outputs = []
+    labels = []
+
+    with torch.no_grad():
+        for images, label in dataloader:
+            images = images.to(device)
+            outputs = model(images)
+            final_outputs.extend(outputs.detach().cpu().numpy())
+            labels.extend(label.cpu().numpy())
+
+    # t-SNE를 사용하여 2차원으로 매핑
+    tsne = TSNE(n_components=2, random_state=0)
+    final_outputs_2d = tsne.fit_transform(np.array(final_outputs))
+    labels = np.array(labels)
+
+    # 시각화
+    plt.figure(figsize=(12, 10))
+    colors = cm.rainbow(np.linspace(0, 1, 100))  # 100개의 클래스에 대한 색상 생성
+    for i, color in enumerate(colors):
+        plt.scatter(
+            final_outputs_2d[labels == i, 0],
+            final_outputs_2d[labels == i, 1],
+            color=color,
+            label=i if i % 10 == 0 else "",
+        )
+    plt.legend(
+        markerscale=2, bbox_to_anchor=(1.05, 1), loc="upper left", fontsize="small"
     )
-
-    teacher.eval()  # Teacher set to evaluation mode
-    student.train()  # Student to train mode
-
-    for epoch in range(epochs):
-        running_loss = 0.0
-        for inputs, labels in train_loader:
-            inputs, labels = inputs.to(device), labels.to(device)
-
-            optimizer.zero_grad()
-
-            # Forward pass with the teacher model - do not save gradients here as we do not change the teacher's weights
-            with torch.no_grad():
-                teacher_logits = teacher(inputs)
-
-            # Forward pass with the student model
-            student_logits = student(inputs)
-
-            # Soften the student logits by applying softmax first and log() second
-            soft_targets = nn.functional.softmax(teacher_logits / T, dim=-1)
-            soft_prob = nn.functional.log_softmax(student_logits / T, dim=-1)
-
-            # Calculate the soft targets loss. Scaled by T**2 as suggested by the authors of the paper "Distilling the knowledge in a neural network"
-            soft_targets_loss = (
-                -torch.sum(soft_targets * soft_prob) / soft_prob.size()[0] * (T**2)
-            )
-
-            # Calculate the true label loss
-            label_loss = ce_loss(student_logits, labels)
-
-            # Weighted sum of the two losses
-            loss = (
-                soft_target_loss_weight * soft_targets_loss
-                + ce_loss_weight * label_loss
-            )
-
-            loss.backward()
-            optimizer.step()
-
-            running_loss += loss.item()
-
-        print(f"Epoch {epoch+1}/{epochs}, Loss: {running_loss / len(train_loader)}")
-
-
-def CTKD_teacher_to_TA(
-    teacher,
-    TA1,
-    TA2,
-    train_loader,
-    epochs,
-    learning_rate,
-    T,
-    soft_target_loss_weight,
-    ce_loss_weight,
-    device,
-):
-    distillation_criterion = nn.KLDivLoss(reduction="batchmean")
-    optimizer1 = optim.SGD(
-        TA1.parameters(),
-        lr=learning_rate,
-        momentum=0.9,
-        nesterov=True,
-        weight_decay=1e-4,
-    )
-    optimizer2 = optim.SGD(
-        TA2.parameters(),
-        lr=learning_rate,
-        momentum=0.9,
-        nesterov=True,
-        weight_decay=1e-4,
-    )
-
-    teacher.eval()  # Teacher set to evaluation mode
-    TA1.train()  # Student to train mode
-    TA2.train()
-
-    for epoch in range(epochs):
-        running_loss = 0.0
-        for inputs, labels in train_loader:
-            inputs, labels = inputs.to(device), labels.to(device)
-
-            with torch.no_grad():
-                teacher_logits = teacher(inputs)
-                teacher_soft_labels = torch.softmax(teacher_logits / T, dim=1)
-
-            # TA1과 TA2에 대해 선택된 인덱스를 사용하여 입력 처리
-            TA1_outputs = TA1(inputs)
-            TA2_outputs = TA2(inputs)
-
-            optimizer1.zero_grad()
-            loss1 = F.cross_entropy(TA1_outputs, labels)
-            distill_loss1 = distillation_criterion(
-                torch.log_softmax(TA1_outputs / T, dim=1),
-                teacher_soft_labels,
-            )
-            total_loss1 = (
-                ce_loss_weight * loss1 + soft_target_loss_weight * distill_loss1
-            )
-            total_loss1.backward()
-            optimizer1.step()
-
-            optimizer2.zero_grad()
-            loss2 = F.cross_entropy(TA2_outputs, labels)
-            distill_loss2 = distillation_criterion(
-                torch.log_softmax(TA2_outputs / T, dim=1),
-                teacher_soft_labels,
-            )
-            total_loss2 = (
-                ce_loss_weight * loss2 + soft_target_loss_weight * distill_loss2
-            )
-            total_loss2.backward()
-            optimizer2.step()
-
-            running_loss += total_loss1.item() + total_loss2.item()
-
-        print(f"Epoch {epoch+1}/{epochs}, Loss: {running_loss / len(train_loader)}")
-
-
-def CTKD_TA_to_TA(
-    TA_Teacher1,
-    TA_Teacher2,
-    TA1,
-    TA2,
-    train_loader,
-    epochs,
-    learning_rate,
-    T,
-    soft_target_loss_weight,
-    ce_loss_weight,
-    device,
-    remember_rate,
-):
-    distillation_criterion = nn.KLDivLoss(reduction="batchmean")
-    optimizer1 = optim.SGD(
-        TA1.parameters(),
-        lr=learning_rate,
-        momentum=0.9,
-        nesterov=True,
-        weight_decay=1e-4,
-    )
-    optimizer2 = optim.SGD(
-        TA2.parameters(),
-        lr=learning_rate,
-        momentum=0.9,
-        nesterov=True,
-        weight_decay=1e-4,
-    )
-
-    TA_Teacher1.eval()  # Teacher set to evaluation mode
-    TA_Teacher2.eval()
-    TA1.train()  # Student to train mode
-    TA2.train()
-
-    for epoch in range(epochs):
-        running_loss = 0.0
-        for inputs, labels in train_loader:
-            inputs, labels = inputs.to(device), labels.to(device)
-
-            # Forward pass with the teacher model - do not save gradients here as we do not change the teacher's weights
-            with torch.no_grad():
-                TA_Teacher1_logits = TA_Teacher1(inputs)
-                TA_Teacher2_logits = TA_Teacher2(inputs)
-
-                TA_Teacher1_soft_labels = torch.softmax(TA_Teacher1_logits / T, dim=1)
-                TA_Teacher2_soft_labels = torch.softmax(TA_Teacher2_logits / T, dim=1)
-
-            TA_Teacher1_loss = F.cross_entropy(
-                TA_Teacher1_logits, labels, reduction="none"
-            )
-            TA_Teacher2_loss = F.cross_entropy(
-                TA_Teacher2_logits, labels, reduction="none"
-            )
-
-            _, topk_indices1 = torch.topk(
-                -TA_Teacher1_loss,
-                k=int(len(TA_Teacher1_loss) * remember_rate),
-                sorted=False,
-            )
-            _, topk_indices2 = torch.topk(
-                -TA_Teacher2_loss,
-                k=int(len(TA_Teacher2_loss) * remember_rate),
-                sorted=False,
-            )
-
-            # 학생 모델에 대한 입력 선택
-            selected_inputs1 = inputs[topk_indices2]
-            selected_labels1 = labels[topk_indices2]
-            selected_inputs2 = inputs[topk_indices1]
-            selected_labels2 = labels[topk_indices1]
-
-            TA1_outputs = TA1(selected_inputs1)
-            TA2_outputs = TA2(selected_inputs2)
-
-            optimizer1.zero_grad()
-            loss1 = F.cross_entropy(TA1_outputs, selected_labels1)
-            distill_loss1 = distillation_criterion(
-                torch.log_softmax(TA1_outputs / T, dim=1),
-                TA_Teacher1_soft_labels[topk_indices2],
-            )
-            total_loss1 = (
-                ce_loss_weight * loss1 + soft_target_loss_weight * distill_loss1
-            )
-            total_loss1.backward()
-            optimizer1.step()
-
-            optimizer2.zero_grad()
-            loss2 = F.cross_entropy(TA2_outputs, selected_labels2)
-            distill_loss2 = distillation_criterion(
-                torch.log_softmax(TA2_outputs / T, dim=1),
-                TA_Teacher2_soft_labels[topk_indices1],
-            )
-            total_loss2 = (
-                ce_loss_weight * loss2 + soft_target_loss_weight * distill_loss2
-            )
-            total_loss2.backward()
-            optimizer2.step()
-
-            running_loss += total_loss1.item() + total_loss2.item()
-
-        print(f"Epoch {epoch+1}/{epochs}, Loss: {running_loss / len(train_loader)}")
-
-
-def CTKD_TA_to_Student(
-    TA1,
-    TA2,
-    student,
-    train_loader,
-    epochs,
-    learning_rate,
-    T,
-    soft_target_loss_weight,
-    ce_loss_weight,
-    device,
-    remember_rate,
-):
-    distillation_criterion = nn.KLDivLoss(reduction="batchmean")
-    optimizer = optim.SGD(
-        student.parameters(),
-        lr=learning_rate,
-        momentum=0.9,
-        nesterov=True,
-        weight_decay=1e-4,
-    )
-
-    TA1.eval()  # Teacher set to evaluation mode
-    TA2.eval()
-    student.train()  # Student to train mode
-
-    for epoch in range(epochs):
-        running_loss = 0.0
-        for inputs, labels in train_loader:
-            inputs, labels = inputs.to(device), labels.to(device)
-
-            with torch.no_grad():
-                TA1_logits = TA1(inputs)
-                TA2_logits = TA2(inputs)
-
-                TA1_soft_labels = torch.softmax(TA1_logits / T, dim=1)
-                TA2_soft_labels = torch.softmax(TA2_logits / T, dim=1)
-
-            TA1_loss = F.cross_entropy(TA1_logits, labels, reduction="none")
-            TA2_loss = F.cross_entropy(TA2_logits, labels, reduction="none")
-
-            _, topk_indices1 = torch.topk(
-                -TA1_loss, k=int(len(TA1_loss) * remember_rate), sorted=False
-            )
-            _, topk_indices2 = torch.topk(
-                -TA2_loss, k=int(len(TA2_loss) * remember_rate), sorted=False
-            )
-
-            # 학생 모델에 대한 입력 선택
-            selected_inputs1 = inputs[topk_indices2]
-            selected_labels1 = labels[topk_indices2]
-            selected_inputs2 = inputs[topk_indices1]
-            selected_labels2 = labels[topk_indices1]
-
-            student1_outputs = student(selected_inputs1)
-            student2_outputs = student(selected_inputs2)
-
-            optimizer.zero_grad()
-            loss1 = F.cross_entropy(student1_outputs, selected_labels1)
-            distill_loss1 = distillation_criterion(
-                torch.log_softmax(student1_outputs / T, dim=1),
-                TA2_soft_labels[topk_indices2],
-            )
-            total_loss1 = (
-                ce_loss_weight * loss1 + soft_target_loss_weight * distill_loss1
-            )
-            total_loss1.backward()
-
-            loss2 = F.cross_entropy(student2_outputs, selected_labels2)
-            distill_loss2 = distillation_criterion(
-                torch.log_softmax(student2_outputs / T, dim=1),
-                TA1_soft_labels[topk_indices1],
-            )
-            total_loss2 = (
-                ce_loss_weight * loss2 + soft_target_loss_weight * distill_loss2
-            )
-            total_loss2.backward()
-            optimizer.step()
-
-            running_loss += total_loss1.item() + total_loss2.item()
-
-        print(f"Epoch {epoch+1}/{epochs}, Loss: {running_loss / len(train_loader)}")
-
-
-def dgkd(
-    student,
-    teacher,
-    ta_list,
-    train_loader,
-    epochs,
-    learning_rate,
-    T,
-    lambda_,
-    device,
-):
-    distillation_criterion = nn.KLDivLoss(reduction="batchmean")
-    optimizer = optim.SGD(
-        student.parameters(),
-        lr=learning_rate,
-        momentum=0.9,
-        nesterov=True,
-        weight_decay=1e-4,
-    )
-
-    teacher.eval()
-    for ta in ta_list:
-        ta.eval()
-    student.train()  # Student to train mode
-
-    for epoch in range(epochs):
-        running_loss = 0.0
-        for inputs, labels in train_loader:
-            inputs, labels = inputs.to(device), labels.to(device)
-
-            optimizer.zero_grad()
-
-            student_logits = student(inputs)
-            loss_SL = F.cross_entropy(student_logits, labels)
-
-            with torch.no_grad():
-                teahcer_logits = teacher(inputs)
-                ta_logits = []
-                for ta in ta_list:
-                    ta_logits.append(ta(inputs))
-
-                loss_KD_list = [
-                    distillation_criterion(
-                        F.log_softmax(student_logits / T, dim=1),
-                        F.softmax(teahcer_logits / T, dim=1),
-                    )
-                ]
-
-                # Teacher Assistants Knowledge Distillation Loss
-                for i in range(len(ta_list)):
-                    loss_KD_list.append(
-                        distillation_criterion(
-                            F.log_softmax(student_logits / T, dim=1),
-                            F.softmax(ta_logits[i] / T, dim=1),
-                        )
-                    )
-
-            for _ in range(len(loss_KD_list) // 2):
-                loss_KD_list.remove(random.choice(loss_KD_list))
-
-            loss = (1 - lambda_) * loss_SL + lambda_ * T * T * sum(loss_KD_list)
-
-            loss.backward()
-            optimizer.step()
-
-            running_loss += loss.item()
-
-        print(f"Epoch {epoch+1}/{epochs}, Loss: {running_loss / len(train_loader)}")
+    plt.title("t-SNE Visualization of CIFAR-100 Model Outputs")
+    plt.xlabel("Component 1")
+    plt.ylabel("Component 2")
+    plt.savefig("output.png")  # 그래프를 output.png 파일로 저장
 
 
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(device)
-
+    config = nni.get_next_parameter()
     # Dataloaders
     train_dataset, test_dataset = data_loader(100)
     train_loader = torch.utils.data.DataLoader(
@@ -505,6 +151,25 @@ if __name__ == "__main__":
     test_loader = torch.utils.data.DataLoader(
         test_dataset, batch_size=128, shuffle=False, num_workers=2
     )
+
+    torch.manual_seed(23)
+
+    new_teacher_model = ConvNetMaker(plane_cifar100_book.get("10")).to(device)
+    new_teacher_path = "./new_teacher_model.pth"
+    if os.path.exists(new_teacher_path):
+        new_teacher_model.load_state_dict(torch.load(new_teacher_path))
+        print("모델을 불러왔습니다.")
+    else:
+        train(
+            new_teacher_model,
+            train_loader,
+            epochs=160,
+            learning_rate=0.1,
+            device=device,
+        )
+        torch.save(new_teacher_model.state_dict(), new_teacher_path)
+
+    # test_accuracy_deep = test(new_teacher_model, test_loader, device)
 
     torch.manual_seed(42)
 
@@ -582,7 +247,7 @@ if __name__ == "__main__":
     TA_model3 = ConvNetMaker(plane_cifar100_book.get("4")).to(device)
     dgkd_student_model = ConvNetMaker(plane_cifar100_book.get("2")).to(device)
 
-    DGKD_student_path = "./DGKD_student_mode.pth"
+    DGKD_student_path = "./DGKD_student_model.pth"
     if os.path.exists(DGKD_student_path):
         dgkd_student_model.load_state_dict(torch.load(DGKD_student_path))
         print("모델을 불러왔습니다.")
@@ -635,85 +300,62 @@ if __name__ == "__main__":
             device=device,
         )
         torch.save(dgkd_student_model.state_dict(), DGKD_student_path)
-        test_accuracy_light_ce_and_DGKD = test(dgkd_student_model, test_loader, device)
+    test_accuracy_light_ce_and_DGKD = test(dgkd_student_model, test_loader, device)
 
-    """TA_model1_1 = ConvNetMaker(plane_cifar100_book.get("8")).to(device)
-    TA_model1_2 = ConvNetMaker(plane_cifar100_book.get("8")).to(device)
-    TA_model2_1 = ConvNetMaker(plane_cifar100_book.get("6")).to(device)
-    TA_model2_2 = ConvNetMaker(plane_cifar100_book.get("6")).to(device)
-    TA_model3_1 = ConvNetMaker(plane_cifar100_book.get("4")).to(device)
-    TA_model3_2 = ConvNetMaker(plane_cifar100_book.get("4")).to(device)
-    co_teaching_student_model = ConvNetMaker(plane_cifar100_book.get("2")).to(device)
+    TA_model1 = ConvNetMaker(plane_cifar100_book.get("8")).to(device)
+    TA_model2 = ConvNetMaker(plane_cifar100_book.get("6")).to(device)
+    TA_model3 = ConvNetMaker(plane_cifar100_book.get("4")).to(device)
+    residual_teaching_student_model = ConvNetMaker(plane_cifar100_book.get("2")).to(
+        device
+    )
     start_time = time.time()
-    CTKD_teacher_to_TA(
+    train_knowledge_distillation(
         teacher=teacher_model,
-        TA1=TA_model1_1,
-        TA2=TA_model1_2,
+        TA=TA_model1,
+        student=TA_model2,
         train_loader=train_loader,
         epochs=160,
         learning_rate=0.1,
         T=2,
-        soft_target_loss_weight=0.5,
-        ce_loss_weight=0.5,
+        lambda_=config.get["lambda_"],
         device=device,
     )
-    TA1_test_accuracy1 = test(TA_model1_1, test_loader, device)
-    TA1_test_accuracy2 = test(TA_model1_2, test_loader, device)
-
-    CTKD_TA_to_TA(
-        TA_Teacher1=TA_model1_1,
-        TA_Teacher2=TA_model1_2,
-        TA1=TA_model2_1,
-        TA2=TA_model2_2,
+    train_knowledge_distillation(
+        teacher=TA_model1,
+        TA=TA_model2,
+        student=TA_model3,
         train_loader=train_loader,
         epochs=160,
         learning_rate=0.1,
         T=2,
-        soft_target_loss_weight=0.5,
-        ce_loss_weight=0.5,
+        lambda_=config.get["lambda_"],
         device=device,
-        remember_rate=1,
     )
-    TA2_test_accuracy1 = test(TA_model2_1, test_loader, device)
-    TA2_test_accuracy2 = test(TA_model2_2, test_loader, device)
-
-    CTKD_TA_to_TA(
-        TA_Teacher1=TA_model2_1,
-        TA_Teacher2=TA_model2_2,
-        TA1=TA_model3_1,
-        TA2=TA_model3_2,
+    train_knowledge_distillation(
+        teacher=TA_model2,
+        TA=TA_model3,
+        student=residual_teaching_student_model,
         train_loader=train_loader,
         epochs=160,
         learning_rate=0.1,
         T=2,
-        soft_target_loss_weight=0.5,
-        ce_loss_weight=0.5,
+        lambda_=config.get["lambda_"],
         device=device,
-        remember_rate=1,
     )
-    TA3_test_accuracy1 = test(TA_model3_1, test_loader, device)
-    TA3_test_accuracy2 = test(TA_model3_2, test_loader, device)
-
-    CTKD_TA_to_Student(
-        TA1=TA_model3_1,
-        TA2=TA_model3_2,
-        student=co_teaching_student_model,
-        train_loader=train_loader,
-        epochs=160,
-        learning_rate=0.1,
-        T=2,
-        soft_target_loss_weight=0.5,
-        ce_loss_weight=0.5,
-        device=device,
-        remember_rate=1,
+    residual_teaching_test_accuracy = test(
+        residual_teaching_student_model, test_loader, device
     )
-    co_teaching_test_accuracy = test(co_teaching_student_model, test_loader, device)
     end_time = time.time()
 
-    CTKD_time = end_time - start_time"""
+    CTKD_time = end_time - start_time
+
+    # print_tSNE(teacher_model, test_loader)
+
     print(f"Teacher accuracy: {test_accuracy_deep:.2f}%")
     # print(f"Student accuracy without teacher: {test_accuracy_light_ce:.2f}%")
     # print(f"Student accuracy with CE + KD: {test_accuracy_light_ce_and_kd:.2f}%")
     print(f"Student accuracy with CE + TAKD: {test_accuracy_light_ce_and_takd:.2f}%")
     print(f"Student accuracy with CE + DGKD: {test_accuracy_light_ce_and_DGKD:.2f}%")
-    print(f"co-teaching: {co_teaching_test_accuracy:.2f}%")
+    print(f"co_teaching_test_accuracy: {residual_teaching_test_accuracy:.2f}%")
+
+    print(CTKD_time)
