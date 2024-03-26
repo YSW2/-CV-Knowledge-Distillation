@@ -5,7 +5,7 @@ trialCodeDirectory: .
 trialGpuNumber: 1
 trialConcurrency: 1
 maxExperimentDuration: 24h
-maxTrialNumber: 100
+maxTrialNumber: 10
 tuner:
   name: TPE
   classArgs:
