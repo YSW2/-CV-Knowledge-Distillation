@@ -52,29 +52,13 @@ if __name__ == "__main__":
         test_dataset, batch_size=128, shuffle=False, num_workers=2
     )
 
-    torch.manual_seed(23)
+    T = 3
+    lr = 0.01
 
     if dataset == 100:
         new_teacher_model = ConvNetMaker(plane_cifar100_book.get("10")).to(device)
     elif dataset == 10:
         new_teacher_model = ConvNetMaker(plane_cifar10_book.get("10")).to(device)
-
-    new_teacher_path = f"model_list/new_teacher_model_{dataset}.pth"
-
-    if os.path.exists(new_teacher_path):
-        new_teacher_model.load_state_dict(torch.load(new_teacher_path))
-        print("모델을 불러왔습니다.")
-    else:
-        train(
-            new_teacher_model,
-            train_loader,
-            epochs=160,
-            learning_rate=0.1,
-            device=device,
-        )
-        torch.save(new_teacher_model.state_dict(), new_teacher_path)
-
-    # test_accuracy_deep = test(new_teacher_model, test_loader, device)
 
     torch.manual_seed(42)
 
@@ -88,12 +72,17 @@ if __name__ == "__main__":
         teacher_model.load_state_dict(torch.load(teacher_path))
         print("모델을 불러왔습니다.")
     else:
-        train(teacher_model, train_loader, epochs=160, learning_rate=0.1, device=device)
+        train(
+            teacher_model,
+            train_loader,
+            epochs=160,
+            learning_rate=lr,
+            device=device,
+            test_loader=test_loader,
+        )
         torch.save(teacher_model.state_dict(), teacher_path)
 
     test_accuracy_deep = test(teacher_model, test_loader, device)
-
-    T = 10
 
     if dataset == 100:
         TA_model1 = ConvNetMaker(plane_cifar100_book.get("8")).to(device)
@@ -112,51 +101,55 @@ if __name__ == "__main__":
         takd_student_model.load_state_dict(torch.load(TAKD_student_path))
         print("TAKD모델을 불러왔습니다.")
     else:
-        train_knowledge_distillation(
-            teacher=teacher_model,
-            student=TA_model1,
-            train_loader=train_loader,
-            epochs=160,
-            learning_rate=0.1,
-            T=T,
-            lambda_=0.75,
-            device=device,
-            test_loader=test_loader,
-            name="TAKD_TA1",
-        )
+        if not os.path.exists(f"model_list/TAKD/TAKD_TA1_T_{T}.pth"):
+            train_knowledge_distillation(
+                teacher=teacher_model,
+                student=TA_model1,
+                train_loader=train_loader,
+                epochs=160,
+                learning_rate=lr,
+                T=T,
+                lambda_=0.75,
+                device=device,
+                test_loader=test_loader,
+                name="TAKD_TA1",
+            )
         TA_model1.load_state_dict(torch.load(f"model_list/TAKD/TAKD_TA1_T_{T}.pth"))
-        train_knowledge_distillation(
-            teacher=TA_model1,
-            student=TA_model2,
-            train_loader=train_loader,
-            epochs=160,
-            learning_rate=0.1,
-            T=T,
-            lambda_=0.75,
-            device=device,
-            test_loader=test_loader,
-            name="TAKD_TA2",
-        )
+        test(TA_model1, test_loader, device)
+        if not os.path.exists(f"model_list/TAKD/TAKD_TA2_T_{T}.pth"):
+            train_knowledge_distillation(
+                teacher=TA_model1,
+                student=TA_model2,
+                train_loader=train_loader,
+                epochs=160,
+                learning_rate=lr,
+                T=T,
+                lambda_=0.75,
+                device=device,
+                test_loader=test_loader,
+                name="TAKD_TA2",
+            )
         TA_model2.load_state_dict(torch.load(f"model_list/TAKD/TAKD_TA2_T_{T}.pth"))
-        train_knowledge_distillation(
-            teacher=TA_model2,
-            student=TA_model3,
-            train_loader=train_loader,
-            epochs=160,
-            learning_rate=0.1,
-            T=T,
-            lambda_=0.75,
-            device=device,
-            test_loader=test_loader,
-            name="TAKD_TA3",
-        )
+        if not os.path.exists(f"model_list/TAKD/TAKD_TA3_T_{T}.pth"):
+            train_knowledge_distillation(
+                teacher=TA_model2,
+                student=TA_model3,
+                train_loader=train_loader,
+                epochs=160,
+                learning_rate=lr,
+                T=T,
+                lambda_=0.75,
+                device=device,
+                test_loader=test_loader,
+                name="TAKD_TA3",
+            )
         TA_model3.load_state_dict(torch.load(f"model_list/TAKD/TAKD_TA3_T_{T}.pth"))
         train_knowledge_distillation(
             teacher=TA_model3,
             student=takd_student_model,
             train_loader=train_loader,
             epochs=160,
-            learning_rate=0.1,
+            learning_rate=0.001,
             T=T,
             lambda_=0.75,
             device=device,
@@ -182,47 +175,50 @@ if __name__ == "__main__":
         dgkd_student_model.load_state_dict(torch.load(DGKD_student_path))
         print("DGKD모델을 불러왔습니다.")
     else:
-        dgkd(
-            student=TA_model1,
-            teacher=teacher_model,
-            ta_list=[],
-            train_loader=train_loader,
-            epochs=160,
-            learning_rate=0.1,
-            T=T,
-            lambda_=0.75,
-            device=device,
-            test_loader=test_loader,
-            name="DGKD_TA1",
-        )
+        if not os.path.exists(f"model_list/DGKD/DGKD_TA1_T_{T}.pth"):
+            dgkd(
+                student=TA_model1,
+                teacher=teacher_model,
+                ta_list=[],
+                train_loader=train_loader,
+                epochs=160,
+                learning_rate=lr,
+                T=T,
+                lambda_=0.75,
+                device=device,
+                test_loader=test_loader,
+                name="DGKD_TA1",
+            )
         TA_model1.load_state_dict(torch.load(f"model_list/DGKD/DGKD_TA1_T_{T}.pth"))
-        dgkd(
-            student=TA_model2,
-            teacher=teacher_model,
-            ta_list=[TA_model1],
-            train_loader=train_loader,
-            epochs=160,
-            learning_rate=0.1,
-            T=T,
-            lambda_=0.75,
-            device=device,
-            test_loader=test_loader,
-            name="DGKD_TA2",
-        )
+        if not os.path.exists(f"model_list/DGKD/DGKD_TA2_T_{T}.pth"):
+            dgkd(
+                student=TA_model2,
+                teacher=teacher_model,
+                ta_list=[TA_model1],
+                train_loader=train_loader,
+                epochs=160,
+                learning_rate=lr,
+                T=T,
+                lambda_=0.75,
+                device=device,
+                test_loader=test_loader,
+                name="DGKD_TA2",
+            )
         TA_model2.load_state_dict(torch.load(f"model_list/DGKD/DGKD_TA2_T_{T}.pth"))
-        dgkd(
-            student=TA_model3,
-            teacher=teacher_model,
-            ta_list=[TA_model1, TA_model2],
-            train_loader=train_loader,
-            epochs=160,
-            learning_rate=0.1,
-            T=T,
-            lambda_=0.75,
-            device=device,
-            test_loader=test_loader,
-            name="DGKD_TA3",
-        )
+        if not os.path.exists(f"model_list/DGKD/DGKD_TA3_T_{T}.pth"):
+            dgkd(
+                student=TA_model3,
+                teacher=teacher_model,
+                ta_list=[TA_model1, TA_model2],
+                train_loader=train_loader,
+                epochs=160,
+                learning_rate=lr,
+                T=T,
+                lambda_=0.75,
+                device=device,
+                test_loader=test_loader,
+                name="DGKD_TA3",
+            )
         TA_model3.load_state_dict(torch.load(f"model_list/DGKD/DGKD_TA3_T_{T}.pth"))
         dgkd(
             student=dgkd_student_model,
@@ -230,7 +226,7 @@ if __name__ == "__main__":
             ta_list=[TA_model1, TA_model2, TA_model3],
             train_loader=train_loader,
             epochs=160,
-            learning_rate=0.1,
+            learning_rate=0.001,
             T=T,
             lambda_=0.75,
             device=device,
@@ -265,59 +261,62 @@ if __name__ == "__main__":
 
     if os.path.exists(test_model_path):
         test_student_model.load_state_dict(
-            torch.load("model_list/test/TEST_student_T_{T}.pth")
+            torch.load(f"model_list/test/TEST_student_T_{T}.pth")
         )
         print("test모델을 불러왔습니다.")
 
     else:
         start_time = time.time()
-        CTKD_teacher_to_TA(
-            teacher=teacher_model,
-            TA1=TA_model1_1,
-            TA2=TA_model1_2,
-            train_loader=train_loader,
-            epochs=160,
-            learning_rate=0.1,
-            T=T,
-            lambda_=0.75,
-            device=device,
-            test_loader=test_loader,
-            name="TEST_TA1",
-        )
+        if not os.path.exists(f"model_list/test/TEST_TA1_1_T_{T}.pth"):
+            CTKD_teacher_to_TA(
+                teacher=teacher_model,
+                TA1=TA_model1_1,
+                TA2=TA_model1_2,
+                train_loader=train_loader,
+                epochs=160,
+                learning_rate=lr,
+                T=T,
+                lambda_=0.75,
+                device=device,
+                test_loader=test_loader,
+                name="TEST_TA1",
+            )
         TA_model1_1.load_state_dict(torch.load(f"model_list/test/TEST_TA1_1_T_{T}.pth"))
         TA_model1_2.load_state_dict(torch.load(f"model_list/test/TEST_TA1_2_T_{T}.pth"))
-        CTKD_TA_to_TA(
-            TA_Teacher1=TA_model1_1,
-            TA_Teacher2=TA_model1_2,
-            TA1=TA_model2_1,
-            TA2=TA_model2_2,
-            train_loader=train_loader,
-            epochs=160,
-            learning_rate=0.1,
-            T=T,
-            lambda_=0.75,
-            device=device,
-            remember_rate=0.5,
-            test_loader=test_loader,
-            name="TEST_TA2",
-        )
+        if not os.path.exists(f"model_list/test/TEST_TA2_1_T_{T}.pth"):
+            CTKD_TA_to_TA(
+                TA_Teacher1=TA_model1_1,
+                TA_Teacher2=TA_model1_2,
+                TA1=TA_model2_1,
+                TA2=TA_model2_2,
+                train_loader=train_loader,
+                epochs=160,
+                learning_rate=lr,
+                T=T,
+                lambda_=0.75,
+                device=device,
+                remember_rate=0.5,
+                test_loader=test_loader,
+                name="TEST_TA2",
+            )
         TA_model2_1.load_state_dict(torch.load(f"model_list/test/TEST_TA2_1_T_{T}.pth"))
         TA_model2_2.load_state_dict(torch.load(f"model_list/test/TEST_TA2_2_T_{T}.pth"))
-        CTKD_TA_to_TA(
-            TA_Teacher1=TA_model2_1,
-            TA_Teacher2=TA_model2_2,
-            TA1=TA_model3_1,
-            TA2=TA_model3_2,
-            train_loader=train_loader,
-            epochs=160,
-            learning_rate=0.1,
-            T=T,
-            lambda_=0.75,
-            device=device,
-            remember_rate=0.5,
-            test_loader=test_loader,
-            name="TEST_TA3",
-        )
+        if not os.path.exists(f"model_list/test/TEST_TA3_1_T_{T}.pth"):
+            CTKD_TA_to_TA(
+                TA_Teacher1=TA_model2_1,
+                TA_Teacher2=TA_model2_2,
+                TA1=TA_model3_1,
+                TA2=TA_model3_2,
+                train_loader=train_loader,
+                epochs=160,
+                learning_rate=lr,
+                T=T,
+                lambda_=0.75,
+                device=device,
+                remember_rate=0.5,
+                test_loader=test_loader,
+                name="TEST_TA3",
+            )
         TA_model3_1.load_state_dict(torch.load(f"model_list/test/TEST_TA3_1_T_{T}.pth"))
         TA_model3_2.load_state_dict(torch.load(f"model_list/test/TEST_TA3_2_T_{T}.pth"))
         CTKD_TA_to_Student(
@@ -326,7 +325,7 @@ if __name__ == "__main__":
             student=test_student_model,
             train_loader=train_loader,
             epochs=160,
-            learning_rate=0.1,
+            learning_rate=lr,
             T=T,
             lambda_=0.75,
             device=device,
@@ -364,9 +363,9 @@ if __name__ == "__main__":
         "DGKD",
     )
 
-    TA_model1.load_state_dict(torch.load(f"model_list/test/test_TA1_T_{T}.pth"))
-    TA_model2.load_state_dict(torch.load(f"model_list/test/test_TA2_T_{T}.pth"))
-    TA_model3.load_state_dict(torch.load(f"model_list/test/test_TA3_T_{T}.pth"))
+    TA_model1.load_state_dict(torch.load(f"model_list/test/test_TA1_1_T_{T}.pth"))
+    TA_model2.load_state_dict(torch.load(f"model_list/test/test_TA2_1_T_{T}.pth"))
+    TA_model3.load_state_dict(torch.load(f"model_list/test/test_TA3_1_T_{T}.pth"))
     test_student_model.load_state_dict(torch.load(test_model_path))
 
     print_error_rate(

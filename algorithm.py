@@ -14,6 +14,7 @@ def train(
     epochs,
     learning_rate,
     device,
+    test_loader,
 ):
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.SGD(
@@ -25,8 +26,11 @@ def train(
     )
 
     model.train()
+    val_acc_list = []
+    best_acc = 0
 
     for epoch in range(epochs):
+        model.train()
         running_loss = 0.0
         for inputs, labels in train_loader:
             # inputs: A collection of batch_size images
@@ -45,6 +49,13 @@ def train(
             running_loss += loss.item()
 
         print(f"Epoch {epoch+1}/{epochs}, Loss: {running_loss / len(train_loader)}")
+        val_acc = test(model, test_loader, device)
+        val_acc_list.append(val_acc)
+        if val_acc > best_acc:
+            best_acc = val_acc
+            torch.save(model.state_dict(), f"model_list/teacher_model.pth")
+
+    print_plt(val_acc_list, epochs, f"model_png/teacher_model")
 
 
 def test(model, test_loader, device):
@@ -73,8 +84,6 @@ def test_for_error(model, test_loader, device):
     model.to(device)
     model.eval()
 
-    correct = 0
-    total = 0
     label_accuracy = []  # 라벨별 정답 여부를 저장할 배열
 
     with torch.no_grad():
@@ -259,7 +268,6 @@ def CTKD_TA_to_TA(
     test_loader=None,
     name=None,
 ):
-    distillation_criterion = nn.KLDivLoss(reduction="batchmean")
     optimizer1 = optim.SGD(
         TA1.parameters(),
         lr=learning_rate,
@@ -299,48 +307,24 @@ def CTKD_TA_to_TA(
                 TA_Teacher1_soft_labels = torch.softmax(TA_Teacher1_logits / T, dim=1)
                 TA_Teacher2_soft_labels = torch.softmax(TA_Teacher2_logits / T, dim=1)
 
-            TA_Teacher1_loss = F.cross_entropy(
-                TA_Teacher1_logits, labels, reduction="none"
-            )
-            TA_Teacher2_loss = F.cross_entropy(
-                TA_Teacher2_logits, labels, reduction="none"
-            )
-
-            _, topk_indices1 = torch.topk(
-                -TA_Teacher1_loss,
-                k=int(len(TA_Teacher1_loss) * remember_rate),
-                sorted=False,
-            )
-            _, topk_indices2 = torch.topk(
-                -TA_Teacher2_loss,
-                k=int(len(TA_Teacher2_loss) * remember_rate),
-                sorted=False,
-            )
-
-            # 학생 모델에 대한 입력 선택
-            selected_inputs1 = inputs[topk_indices2]
-            selected_labels1 = labels[topk_indices2]
-            selected_inputs2 = inputs[topk_indices1]
-            selected_labels2 = labels[topk_indices1]
-
-            TA1_outputs = TA1(selected_inputs1)
-            TA2_outputs = TA2(selected_inputs2)
+            TA1_outputs = TA1(inputs)
+            TA2_outputs = TA2(inputs)
 
             optimizer1.zero_grad()
-            loss1 = F.cross_entropy(TA1_outputs, selected_labels1)
-            distill_loss1 = distillation_criterion(
+            loss1 = F.cross_entropy(TA1_outputs, labels)
+            distill_loss1 = F.kl_div(
                 torch.log_softmax(TA1_outputs / T, dim=1),
-                TA_Teacher1_soft_labels[topk_indices2],
+                TA_Teacher1_soft_labels,
             )
             total_loss1 = lambda_ * loss1 + (1 - lambda_) * T * T * distill_loss1
             total_loss1.backward()
             optimizer1.step()
 
             optimizer2.zero_grad()
-            loss2 = F.cross_entropy(TA2_outputs, selected_labels2)
-            distill_loss2 = distillation_criterion(
+            loss2 = F.cross_entropy(TA2_outputs, labels)
+            distill_loss2 = F.kl_div(
                 torch.log_softmax(TA2_outputs / T, dim=1),
-                TA_Teacher2_soft_labels[topk_indices1],
+                TA_Teacher2_soft_labels,
             )
             total_loss2 = lambda_ * loss2 + (1 - lambda_) * T * T * distill_loss2
             total_loss2.backward()
@@ -378,7 +362,6 @@ def CTKD_TA_to_Student(
     test_loader=None,
     name=None,
 ):
-    distillation_criterion = nn.KLDivLoss(reduction="batchmean")
     optimizer = optim.SGD(
         student.parameters(),
         lr=learning_rate,
@@ -416,17 +399,17 @@ def CTKD_TA_to_Student(
             )
 
             # 학생 모델에 대한 입력 선택
-            selected_inputs1 = inputs[topk_indices2]
-            selected_labels1 = labels[topk_indices2]
-            selected_inputs2 = inputs[topk_indices1]
-            selected_labels2 = labels[topk_indices1]
+            selected_inputs1 = inputs[topk_indices1]
+            selected_labels1 = labels[topk_indices1]
+            selected_inputs2 = inputs[topk_indices2]
+            selected_labels2 = labels[topk_indices2]
 
             student1_outputs = student(selected_inputs1)
             student2_outputs = student(selected_inputs2)
 
             optimizer.zero_grad()
             loss1 = F.cross_entropy(student1_outputs, selected_labels1)
-            distill_loss1 = distillation_criterion(
+            distill_loss1 = F.kl_div(
                 torch.log_softmax(student1_outputs / T, dim=1),
                 TA2_soft_labels[topk_indices2],
             )
@@ -434,7 +417,7 @@ def CTKD_TA_to_Student(
             total_loss1.backward()
 
             loss2 = F.cross_entropy(student2_outputs, selected_labels2)
-            distill_loss2 = distillation_criterion(
+            distill_loss2 = F.kl_div(
                 torch.log_softmax(student2_outputs / T, dim=1),
                 TA1_soft_labels[topk_indices1],
             )
