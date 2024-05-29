@@ -6,6 +6,10 @@ from torch import nn, optim
 import random
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
+import matplotlib.colors as colors
+import time
+from collections import defaultdict
+from ema import EMA
 
 
 def train(
@@ -15,6 +19,7 @@ def train(
     learning_rate,
     device,
     test_loader,
+    name,
 ):
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.SGD(
@@ -27,6 +32,7 @@ def train(
 
     model.train()
     val_acc_list = []
+    loss_list = []
     best_acc = 0
 
     for epoch in range(epochs):
@@ -49,16 +55,18 @@ def train(
             running_loss += loss.item()
 
         print(f"Epoch {epoch+1}/{epochs}, Loss: {running_loss / len(train_loader)}")
+        loss_list.append(running_loss / len(train_loader))
         val_acc = test(model, test_loader, device)
         val_acc_list.append(val_acc)
         if val_acc > best_acc:
             best_acc = val_acc
-            torch.save(model.state_dict(), f"model_list/teacher_model.pth")
+            torch.save(model.state_dict(), f"model_list/{name}.pth")
 
-    print_plt(val_acc_list, epochs, f"model_png/teacher_model")
+    print_plt(val_acc_list, epochs, f"model_png/{name}", loss_list=loss_list)
 
 
 def test(model, test_loader, device):
+    criterion = nn.CrossEntropyLoss(reduction="none")
     model.to(device)
     model.eval()
 
@@ -66,7 +74,7 @@ def test(model, test_loader, device):
     total = 0
 
     with torch.no_grad():
-        for inputs, labels in test_loader:
+        for inputs, labels, indices in test_loader:
             inputs, labels = inputs.to(device), labels.to(device)
 
             outputs = model(inputs)
@@ -78,6 +86,135 @@ def test(model, test_loader, device):
     accuracy = 100 * correct / total
     print(f"Test Accuracy: {accuracy:.2f}%")
     return accuracy
+
+
+def test_ensemble(models, test_loader, device):
+    criterion = nn.CrossEntropyLoss(reduction="none")
+    models = [model.to(device).eval() for model in models]
+
+    correct = 0
+    total = 0
+
+    with torch.no_grad():
+        for inputs, labels, _ in test_loader:
+            inputs, labels = inputs.to(device), labels.to(device)
+
+            outputs = torch.zeros(inputs.size(0), 100).to(device)
+            for model in models:
+                outputs += model(inputs)
+            outputs /= len(models)
+            print(outputs.shape)
+            _, predicted = torch.max(outputs.data, 1)
+
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+
+    accuracy = 100 * correct / total
+    print(f"Test Accuracy: {accuracy:.2f}%")
+    return accuracy
+
+
+def test_ensemble_with_confidence_weighted_average(models, test_loader, device):
+    criterion = nn.CrossEntropyLoss(reduction="none")
+    models = [model.to(device).eval() for model in models]
+
+    correct = 0
+    total = 0
+
+    with torch.no_grad():
+        for inputs, labels, _ in test_loader:
+            inputs, labels = inputs.to(device), labels.to(device)
+
+            # 각 모델의 출력을 저장할 리스트
+            all_outputs = []
+
+            for model in models:
+                outputs = model(inputs)
+                all_outputs.append(outputs)
+
+            # 각 모델의 확신도 계산 (가장 높은 softmax 확률 값)
+            confidences = []
+            for outputs in all_outputs:
+                softmax_outputs = nn.functional.softmax(outputs, dim=1)
+                max_confidence, _ = torch.max(softmax_outputs, dim=1)
+                confidences.append(max_confidence.mean().item())
+
+            # 확신도를 가중치로 사용하여 가중 평균 계산 (확신도를 제곱하여 차이를 두드러지게 함)
+            confidences = torch.tensor(confidences, device=device)
+            confidences = torch.exp(confidences)  # 확신도를 제곱하여 차이를 확대
+            weights = confidences / confidences.sum()
+
+            print(weights)
+            # 가중 평균 계산
+            weighted_outputs = torch.zeros(inputs.size(0), 100).to(device)
+            for i, outputs in enumerate(all_outputs):
+                weighted_outputs += weights[i] * outputs
+
+            print(weighted_outputs.shape)
+            _, predicted = torch.max(weighted_outputs.data, 1)
+
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+
+    accuracy = 100 * correct / total
+    print(f"Test Accuracy: {accuracy:.2f}%")
+    return accuracy
+
+
+def test_ensemble_class_accuracy(models, test_loader, device):
+    models = [model.to(device).eval() for model in models]
+
+    # 클래스별로 맞춘 개수와 전체 개수를 저장할 딕셔너리
+    class_correct = defaultdict(int)
+    class_total = defaultdict(int)
+
+    with torch.no_grad():
+        for inputs, labels, _ in test_loader:
+            inputs, labels = inputs.to(device), labels.to(device)
+
+            # 각 모델의 출력을 저장할 리스트
+            all_outputs = []
+
+            for model in models:
+                outputs = model(inputs)
+                all_outputs.append(outputs)
+
+            # 각 모델의 확신도 계산 (가장 높은 softmax 확률 값)
+            confidences = []
+            for outputs in all_outputs:
+                softmax_outputs = nn.functional.softmax(outputs, dim=1)
+                max_confidence, _ = torch.max(softmax_outputs, dim=1)
+                confidences.append(max_confidence.mean().item())
+
+            # 확신도를 가중치로 사용하여 가중 평균 계산
+            confidences = torch.tensor(confidences, device=device)
+            confidences = confidences**2  # 확신도를 제곱하여 차이를 확대
+            weights = confidences / confidences.sum()
+
+            # 가중 평균 계산
+            weighted_outputs = torch.zeros(inputs.size(0), 100).to(device)
+            for i, outputs in enumerate(all_outputs):
+                weighted_outputs += weights[i] * outputs
+
+            _, predicted = torch.max(weighted_outputs.data, 1)
+
+            # 각 클래스에 대한 정확도 계산
+            for i in range(len(labels)):
+                label = labels[i].item()
+                class_correct[label] += (predicted[i] == label).item()
+                class_total[label] += 1
+
+    # 클래스별 정확도 계산
+    class_accuracy = {
+        cls: 100 * class_correct[cls] / class_total[cls] for cls in class_total
+    }
+
+    # 정확도에 따라 클래스별로 정렬
+    sorted_class_accuracy = sorted(class_accuracy.items(), key=lambda item: item[0])
+
+    probabilities = [prob for _, prob in sorted_class_accuracy]
+
+    return probabilities
 
 
 def test_for_error(model, test_loader, device):
@@ -93,10 +230,36 @@ def test_for_error(model, test_loader, device):
             outputs = model(inputs)
             _, predicted = torch.max(outputs.data, 1)
 
+            print(labels)
             # 라벨별 정답 여부를 배열에 추가
-            label_accuracy.extend((predicted == labels).cpu().tolist())
+            label_accuracy.extend((predicted != labels).cpu().tolist())
 
+    print(label_accuracy)
     return np.array(label_accuracy)
+
+
+def error_overlap_loss(y_true, y_pred_teacher, y_pred_student):
+    teacher_predictions = torch.argmax(y_pred_teacher, dim=1)
+    student_predictions = torch.argmax(y_pred_student, dim=1)
+    true_max = torch.argmax(y_true, dim=1)
+
+    # 예측이 틀렸는지 확인
+    teacher_errors = teacher_predictions != true_max
+    student_errors = student_predictions != true_max
+
+    overlap_errors = teacher_errors & student_errors
+    same_error_class = teacher_predictions == student_predictions
+    error_overlap_loss = (
+        torch.logical_and(overlap_errors, same_error_class).float().mean()
+    )
+
+    # 오버랩된 틀린 예측에 대해 손실 부여
+    return error_overlap_loss
+
+
+########################################################################################################################################
+########################################################################################################################################
+########################################################################################################################################
 
 
 def train_knowledge_distillation(
@@ -111,7 +274,7 @@ def train_knowledge_distillation(
     test_loader=None,
     name=None,
 ):
-
+    criterion = nn.CrossEntropyLoss(reduction="none")
     optimizer = optim.SGD(
         student.parameters(),
         lr=learning_rate,
@@ -122,12 +285,22 @@ def train_knowledge_distillation(
 
     teacher.eval()  # Teacher set to evaluation mode
     val_acc_list = []
+    loss_list = []
     best_acc = 0
 
+    ce_loss_list = []
+    kl_loss_list = []
     for epoch in range(epochs):
+        # cifar_class_per_value = torch.zeros(100, device=device)
+        # cifar_class_count = torch.zeros(100, device=device)
+
+        # cifar_distill_per_value = torch.zeros(100, device=device)
+        # cifar_distill_count = torch.zeros(100, device=device)
+
         student.train()  # Student to train mode
         running_loss = 0.0
-        for inputs, labels in train_loader:
+
+        for inputs, labels, indices in train_loader:
             inputs, labels = inputs.to(device), labels.to(device)
 
             optimizer.zero_grad()
@@ -140,12 +313,23 @@ def train_knowledge_distillation(
             # Forward pass with the student model
             student_logits = student(inputs)
 
-            student_label_loss = F.cross_entropy(student_logits, labels)
-            distill_loss = F.kl_div(
+            student_label_loss = criterion(student_logits, labels)
+
+            # for label, loss in zip(labels, student_label_loss):
+            #     cifar_class_count[label] += 1
+            #     cifar_class_per_value[label] += loss
+
+            student_label_loss = student_label_loss.mean()
+            distill_loss = nn.KLDivLoss(reduction="none")(
                 torch.log_softmax(student_logits / T, dim=1),
                 teacher_soft_labels,
             )
 
+            # for label, loss in zip(labels, distill_loss.mean(dim=1)):
+            #     cifar_distill_count[label] += 1
+            #     cifar_distill_per_value[label] += loss
+
+            distill_loss = distill_loss.mean()
             loss = lambda_ * student_label_loss + (1 - lambda_) * T * T * distill_loss
 
             loss.backward()
@@ -154,13 +338,119 @@ def train_knowledge_distillation(
             running_loss += loss.item()
 
         print(f"Epoch {epoch+1}/{epochs}, Loss: {running_loss / len(train_loader)}")
+
+        # cifar_class_per_value /= cifar_class_count.clamp(min=1)
+        # print(cifar_class_per_value)
+
+        # cifar_class_per_value_cpu = (
+        #     cifar_class_per_value.detach().cpu().numpy().reshape(10, 10)
+        # )
+
+        # print_cifar_heatmap(
+        #     cifar_class_per_value_cpu,
+        #     epoch,
+        #     running_loss / len(train_loader),
+        # )
+
+        # cifar_distill_per_value /= cifar_distill_count.clamp(min=1)
+        # print(cifar_distill_per_value)
+
+        # cifar_distill_per_value_cpu = (
+        #     cifar_distill_per_value.detach().cpu().numpy().reshape(10, 10)
+        # )
+        # print_cifar_distill_heatmap(
+        #     cifar_distill_per_value_cpu,
+        #     epoch,
+        #     running_loss / len(train_loader),
+        # )
+
+        loss_list.append(running_loss / len(train_loader))
         val_acc = test(student, test_loader, device)
         val_acc_list.append(val_acc)
         if val_acc > best_acc:
             best_acc = val_acc
             torch.save(student.state_dict(), f"model_list/TAKD/{name}_T_{T}.pth")
 
-    print_plt(val_acc_list, epochs, f"model_png/TAKD/{name}_T_{T}")
+    return val_acc_list
+    # print_plt(val_acc_list, epochs, f"model_png/TAKD/{name}_T_{T}", loss_list=loss_list)
+
+
+def test_kd_model(
+    student,
+    teacher_list,
+    class_table,
+    train_loader,
+    epochs,
+    learning_rate,
+    T,
+    lambda_,
+    device,
+    test_loader=None,
+    name=None,
+):
+    optimizer = optim.SGD(
+        student.parameters(),
+        lr=learning_rate,
+        momentum=0.9,
+        nesterov=True,
+        weight_decay=1e-4,
+    )
+
+    val_acc_list = []
+    loss_list = []
+    best_acc = 0
+
+    teacher_list = [model.eval() for model in teacher_list]
+    class_table = [torch.tensor(table).to(device) for table in class_table]
+
+    for epoch in range(epochs):
+        start_time = time.time()
+
+        student.train()  # Student to train mode
+        running_loss = 0.0
+        for inputs, labels, indices in train_loader:
+            inputs, labels = inputs.to(device), labels.to(device)
+            teacher_avg_output = torch.zeros(inputs.size(0), 100).to(device)
+
+            student_logits = student(inputs)
+            loss_SL = F.cross_entropy(student_logits, labels)
+
+            with torch.no_grad():
+                all_outputs = []
+
+                for teacher, table in zip(teacher_list, class_table):
+                    outputs = teacher(inputs)
+                    outputs_softmax = torch.softmax(outputs, reduction="none")
+                    print(outputs_softmax.shape, table.shape)
+                    outputs_softmax *= table[indices]
+                    all_outputs.append(outputs)
+
+                teacher_avg_output = sum(all_outputs) / len(teacher_list)
+
+            loss_KD = nn.KLDivLoss()(
+                F.log_softmax(student_logits / T, dim=1), teacher_avg_output
+            )
+
+            loss = lambda_ * loss_SL + (1 - lambda_) * T * T * loss_KD
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            running_loss += loss.item()
+
+        print((time.time() - start_time))
+
+        print(f"Epoch {epoch+1}/{epochs}, Loss: {running_loss / len(train_loader)}")
+        loss_list.append(running_loss / len(train_loader))
+        val_acc = test(student, test_loader, device)
+        val_acc_list.append(val_acc)
+
+        if val_acc > best_acc:
+            best_acc = val_acc
+            torch.save(student.state_dict(), f"model_list/test/{name}_T_{T}.pth")
+
+    print_plt(val_acc_list, epochs, f"model_png/test/{name}_T_{T}", loss_list=loss_list)
 
 
 def CTKD_teacher_to_TA(
@@ -373,6 +663,7 @@ def CTKD_TA_to_Student(
     TA1.eval()  # Teacher set to evaluation mode
     TA2.eval()
     val_acc_list = []
+    loss_list = []
     best_acc = 0
 
     for epoch in range(epochs):
@@ -428,6 +719,7 @@ def CTKD_TA_to_Student(
             running_loss += total_loss1.item() + total_loss2.item()
 
         print(f"Epoch {epoch+1}/{epochs}, Loss: {running_loss / len(train_loader)}")
+        loss_list.append(running_loss / len(train_loader))
         val_acc = test(student, test_loader, device)
         val_acc_list.append(val_acc)
 
@@ -451,7 +743,6 @@ def dgkd(
     test_loader=None,
     name=None,
 ):
-    distillation_criterion = nn.KLDivLoss(reduction="batchmean")
     optimizer = optim.SGD(
         student.parameters(),
         lr=learning_rate,
@@ -464,12 +755,13 @@ def dgkd(
     for ta in ta_list:
         ta.eval()
     val_acc_list = []
+    loss_list = []
     best_acc = 0
 
     for epoch in range(epochs):
         student.train()  # Student to train mode
         running_loss = 0.0
-        for inputs, labels in train_loader:
+        for inputs, labels, _ in train_loader:
             inputs, labels = inputs.to(device), labels.to(device)
 
             optimizer.zero_grad()
@@ -483,21 +775,21 @@ def dgkd(
                 for ta in ta_list:
                     ta_logits.append(ta(inputs))
 
-                loss_KD_list = [
-                    distillation_criterion(
-                        F.log_softmax(student_logits / T, dim=1),
-                        F.softmax(teahcer_logits / T, dim=1),
-                    )
-                ]
+            loss_KD_list = [
+                nn.KLDivLoss()(
+                    F.log_softmax(student_logits / T, dim=1),
+                    F.softmax(teahcer_logits / T, dim=1),
+                )
+            ]
 
-                # Teacher Assistants Knowledge Distillation Loss
-                for i in range(len(ta_list)):
-                    loss_KD_list.append(
-                        distillation_criterion(
-                            F.log_softmax(student_logits / T, dim=1),
-                            F.softmax(ta_logits[i] / T, dim=1),
-                        )
+            # Teacher Assistants Knowledge Distillation Loss
+            for i in range(len(ta_list)):
+                loss_KD_list.append(
+                    nn.KLDivLoss()(
+                        F.log_softmax(student_logits / T, dim=1),
+                        F.softmax(ta_logits[i] / T, dim=1),
                     )
+                )
 
             for _ in range(len(loss_KD_list) // 2):
                 loss_KD_list.remove(random.choice(loss_KD_list))
@@ -510,6 +802,7 @@ def dgkd(
             running_loss += loss.item()
 
         print(f"Epoch {epoch+1}/{epochs}, Loss: {running_loss / len(train_loader)}")
+        loss_list.append(running_loss / len(train_loader))
         val_acc = test(student, test_loader, device)
         val_acc_list.append(val_acc)
 
@@ -517,7 +810,7 @@ def dgkd(
             best_acc = val_acc
             torch.save(student.state_dict(), f"model_list/DGKD/{name}_T_{T}.pth")
 
-    print_plt(val_acc_list, epochs, f"model_png/DGKD/{name}_T_{T}")
+    print_plt(val_acc_list, epochs, f"model_png/DGKD/{name}_T_{T}", loss_list=loss_list)
 
 
 def print_tSNE(model, dataloader, device):
@@ -561,42 +854,138 @@ def print_plt(
     val_acc_list,
     epochs,
     name,
+    loss_list=None,
 ):
     plt.clf()
-    plt.plot(
+
+    fig, ax1 = plt.subplots()
+
+    ax1.set_xlabel("Epoch")
+    ax1.set_ylabel("Accuracy", color="tab:blue")
+    ax1.plot(
         range(1, epochs + 1), val_acc_list, marker="o", color="b", label="Test Accuracy"
     )
+    ax1.tick_params(axis="y", labelcolor="tab:blue")
+
+    if loss_list:
+        ax2 = ax1.twinx()
+        ax2.set_ylabel("Loss", color="tab:red")
+        ax2.plot(
+            range(1, epochs + 1), loss_list, marker="o", color="r", label="Train Loss"
+        )
+        ax2.tick_params(axis="y", labelcolor="tab:red")
+        ax2.set_yscale("log")
+
+    fig.tight_layout()
+
     plt.title(f"{name}Test Accuracy by Epoch")
-    plt.xlabel("Epoch")
-    plt.ylabel("Accuracy (%)")
     plt.legend()
     plt.grid(True)
     plt.savefig(f"{name}.png")
+    plt.close()
 
 
-def print_error_rate(model_list, test_loader, device, name):
-    error_list = []
-    overlap_errors_list = []
-
-    for model in model_list:
-        error_list.append(test_for_error(model, test_loader, device))
-
-    for i in range(1, len(error_list)):
-        overlap_errors = np.logical_not(
-            (np.logical_or(error_list[i - 1], error_list[i]))
-        )
-        total_errors = np.logical_not(
-            (np.logical_and(error_list[i - 1], error_list[i]))
-        )
-        overlap_errors_list.append(np.sum((overlap_errors) / np.sum(total_errors)))
-
+def print_double_plt(
+    val_acc_list1,
+    val_acc_list2,
+    epochs,
+    name,
+):
     plt.clf()
-    plt.bar(
-        [f"model{i} & model1{i+1}" for i in range(len(overlap_errors_list))],
-        overlap_errors_list,
-        color=["blue"],
+
+    fig, ax1 = plt.subplots()
+
+    ax1.set_xlabel("Epoch")
+    ax1.set_ylabel("Accuracy", color="tab:blue")
+    ax1.plot(
+        range(1, epochs + 1),
+        val_acc_list1,
+        marker="o",
+        color="b",
+        label="default",
     )
-    plt.title(f"{name} error overlap rate")
-    plt.ylabel("Rate (%)")
-    plt.ylim(0, 1)
-    plt.savefig(f"error_overlap_rate/{name}_error_overlap.png")
+    ax1.plot(range(1, epochs + 1), val_acc_list2, marker="x", color="r", label="KD")
+
+    ax1.tick_params(axis="y", labelcolor="tab:blue")
+    fig.legend(loc="upper right")  # 범례 위치 조정
+    fig.tight_layout()
+    plt.grid(True)
+    plt.savefig(f"{name}.png")
+    plt.close()
+
+
+def print_cifar_heatmap(tensor, epoch, loss):
+    plt.figure(figsize=(8, 6))
+    plt.imshow(
+        tensor, cmap="viridis", norm=colors.LogNorm(vmin=1e-3, vmax=5)
+    )  # cmap 파라미터로 원하는 컬러맵 지정 가능
+    plt.colorbar()  # 색상 막대 표시
+
+    plt.savefig(f"heatmap/epoch {epoch} loss {loss}.png")
+    plt.close()
+
+
+def print_cifar_distill_heatmap(tensor, epoch, loss):
+    plt.figure(figsize=(8, 6))
+    plt.imshow(
+        tensor, cmap="viridis", norm=colors.LogNorm(vmin=1e-4, vmax=1e-1)
+    )  # cmap 파라미터로 원하는 컬러맵 지정 가능
+    plt.colorbar()  # 색상 막대 표시
+
+    plt.savefig(f"distill_heatmap/epoch {epoch} loss {loss}.png")
+    plt.close()
+
+
+def get_one_heatmap(model, device, test_loader):
+    criterion = nn.CrossEntropyLoss(reduction="none")
+    model.eval()
+
+    cifar_class_per_value = torch.zeros(100, device=device)
+    cifar_class_count = torch.zeros(100, device=device)
+
+    for inputs, labels in test_loader:
+        inputs, labels = inputs.to(device), labels.to(device)
+
+        with torch.no_grad():
+            logits = model(inputs)
+            label_loss = criterion(logits, labels)
+
+        for label, loss in zip(labels, label_loss):
+            cifar_class_count[label] += 1
+            cifar_class_per_value[label] += loss
+
+    cifar_class_per_value /= cifar_class_count.clamp(min=1)
+
+    cifar_class_per_value_cpu = (
+        cifar_class_per_value.detach().cpu().numpy().reshape(10, 10)
+    )
+    print_cifar_heatmap(cifar_class_per_value_cpu, -1, label_loss.mean())
+    plt.close()
+
+
+def print_weight_data(weight, epoch):
+    weight = weight.cpu().numpy()
+
+    print(weight)
+    plt.figure(figsize=(10, 8))
+    plt.imshow(
+        weight, cmap="viridis", vmin=-1, vmax=1
+    )  # cmap 파라미터로 원하는 컬러맵 지정 가능
+    plt.colorbar()  # 색상 막대 표시
+
+    plt.savefig(f"weight/weight_epoch_{epoch}.png")
+    plt.close()
+
+
+def create_model_table(data_loader, model, T, device):
+    model_table = torch.zeros((50000, 100), device=device)
+    model.eval()
+    for input, _, idx in data_loader:
+        with torch.no_grad():
+            input = input.to(device)
+
+            logits = model(input)
+            soft_logits = F.softmax(logits / T, dim=1)
+            model_table[idx] = soft_logits
+
+    return model_table
